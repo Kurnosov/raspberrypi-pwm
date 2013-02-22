@@ -35,6 +35,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 
+// BCM numbering scheme
 static uint8_t pin2gpio[] = {
     4,  // P1-7
     17, // P1-11
@@ -46,9 +47,9 @@ static uint8_t pin2gpio[] = {
     25, // P1-22
 };
 
-#define NUM_CHANNELS        (sizeof(pin2gpio)/sizeof(pin2gpio[0]))
+#define NUM_CHANNELS    (sizeof(pin2gpio)/sizeof(pin2gpio[0]))
 
-#define DEVFILE         "/dev/pi-blaster"
+#define DEVFILE         "/dev/rpio-pwm"
 
 #define PAGE_SIZE       4096
 #define PAGE_SHIFT      12
@@ -61,19 +62,19 @@ static uint8_t pin2gpio[] = {
 // will use too much memory bandwidth.  10us is a good value, though you
 // might be ok setting it as low as 2us.
 
-#define CYCLE_TIME_US       10000
+#define CYCLE_TIME_US   10000
 #define SAMPLE_US       10
 #define NUM_SAMPLES     (CYCLE_TIME_US/SAMPLE_US)
 #define NUM_CBS         (NUM_SAMPLES*2)
 
 #define NUM_PAGES       ((NUM_CBS * 32 + NUM_SAMPLES * 4 + \
-                    PAGE_SIZE - 1) >> PAGE_SHIFT)
+                        PAGE_SIZE - 1) >> PAGE_SHIFT)
 
 #define DMA_BASE        0x20007000
 #define DMA_LEN         0x24
 #define PWM_BASE        0x2020C000
 #define PWM_LEN         0x28
-#define CLK_BASE            0x20101000
+#define CLK_BASE        0x20101000
 #define CLK_LEN         0xA8
 #define GPIO_BASE       0x20200000
 #define GPIO_LEN        0x100
@@ -81,15 +82,15 @@ static uint8_t pin2gpio[] = {
 #define PCM_LEN         0x24
 
 #define DMA_NO_WIDE_BURSTS  (1<<26)
-#define DMA_WAIT_RESP       (1<<3)
+#define DMA_WAIT_RESP   (1<<3)
 #define DMA_D_DREQ      (1<<6)
-#define DMA_PER_MAP(x)      ((x)<<16)
+#define DMA_PER_MAP(x)  ((x)<<16)
 #define DMA_END         (1<<1)
 #define DMA_RESET       (1<<31)
 #define DMA_INT         (1<<2)
 
 #define DMA_CS          (0x00/4)
-#define DMA_CONBLK_AD       (0x04/4)
+#define DMA_CONBLK_AD   (0x04/4)
 #define DMA_DEBUG       (0x20/4)
 
 #define GPIO_FSEL0      (0x00/4)
@@ -97,10 +98,10 @@ static uint8_t pin2gpio[] = {
 #define GPIO_CLR0       (0x28/4)
 #define GPIO_LEV0       (0x34/4)
 #define GPIO_PULLEN     (0x94/4)
-#define GPIO_PULLCLK        (0x98/4)
+#define GPIO_PULLCLK    (0x98/4)
 
-#define GPIO_MODE_IN        0
-#define GPIO_MODE_OUT       1
+#define GPIO_MODE_IN    0
+#define GPIO_MODE_OUT   1
 
 #define PWM_CTL         (0x00/4)
 #define PWM_DMAC        (0x08/4)
@@ -110,13 +111,13 @@ static uint8_t pin2gpio[] = {
 #define PWMCLK_CNTL     40
 #define PWMCLK_DIV      41
 
-#define PWMCTL_MODE1        (1<<1)
-#define PWMCTL_PWEN1        (1<<0)
+#define PWMCTL_MODE1    (1<<1)
+#define PWMCTL_PWEN1    (1<<0)
 #define PWMCTL_CLRF     (1<<6)
-#define PWMCTL_USEF1        (1<<5)
+#define PWMCTL_USEF1    (1<<5)
 
-#define PWMDMAC_ENAB        (1<<31)
-#define PWMDMAC_THRSHLD     ((15<<8)|(15<<0))
+#define PWMDMAC_ENAB     (1<<31)
+#define PWMDMAC_THRSHLD  ((15<<8)|(15<<0))
 
 #define PCM_CS_A        (0x00/4)
 #define PCM_FIFO_A      (0x04/4)
@@ -125,14 +126,14 @@ static uint8_t pin2gpio[] = {
 #define PCM_TXC_A       (0x10/4)
 #define PCM_DREQ_A      (0x14/4)
 #define PCM_INTEN_A     (0x18/4)
-#define PCM_INT_STC_A       (0x1c/4)
+#define PCM_INT_STC_A   (0x1c/4)
 #define PCM_GRAY        (0x20/4)
 
 #define PCMCLK_CNTL     38
 #define PCMCLK_DIV      39
 
-#define DELAY_VIA_PWM       0
-#define DELAY_VIA_PCM       1
+#define DELAY_VIA_PWM   0
+#define DELAY_VIA_PCM   1
 
 typedef struct {
     uint32_t info, src, dst, length,
@@ -166,16 +167,17 @@ static float channel_pwm[NUM_CHANNELS];
 static void set_pwm(int channel, float value);
 static void update_pwm();
 
+// Sets a GPIO to either GPIO_MODE_IN(=0) or GPIO_MODE_OUT(=1)
 static void
 gpio_set_mode(uint32_t pin, uint32_t mode)
 {
     uint32_t fsel = gpio_reg[GPIO_FSEL0 + pin/10];
-
     fsel &= ~(7 << ((pin % 10) * 3));
     fsel |= mode << ((pin % 10) * 3);
     gpio_reg[GPIO_FSEL0 + pin/10] = fsel;
 }
 
+// Sets the gpio to input (level=1) or output (level=0) 
 static void
 gpio_set(int pin, int level)
 {
@@ -185,14 +187,15 @@ gpio_set(int pin, int level)
         gpio_reg[GPIO_CLR0] = 1 << pin;
 }
 
+// Delay for the specified amount of microseconds
 static void
 udelay(int us)
 {
     struct timespec ts = { 0, us * 1000 };
-
     nanosleep(&ts, NULL);
 }
 
+// Shutdown DMA and FIFO, and exit program
 static void
 terminate(int dummy)
 {
@@ -236,10 +239,10 @@ map_peripheral(uint32_t base, uint32_t len)
     void * vaddr;
 
     if (fd < 0)
-        fatal("pi-blaster: Failed to open /dev/mem: %m\n");
+        fatal("rpio-pwm: Failed to open /dev/mem: %m\n");
     vaddr = mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, base);
     if (vaddr == MAP_FAILED)
-        fatal("pi-blaster: Failed to map peripheral at 0x%08x: %m\n", base);
+        fatal("rpio-pwm: Failed to map peripheral at 0x%08x: %m\n", base);
     close(fd);
 
     return vaddr;
@@ -312,18 +315,18 @@ make_pagemap(void)
 
     page_map = malloc(NUM_PAGES * sizeof(*page_map));
     if (page_map == 0)
-        fatal("pi-blaster: Failed to malloc page_map: %m\n");
+        fatal("rpio-pwm: Failed to malloc page_map: %m\n");
     memfd = open("/dev/mem", O_RDWR);
     if (memfd < 0)
-        fatal("pi-blaster: Failed to open /dev/mem: %m\n");
+        fatal("rpio-pwm: Failed to open /dev/mem: %m\n");
     pid = getpid();
     sprintf(pagemap_fn, "/proc/%d/pagemap", pid);
     fd = open(pagemap_fn, O_RDONLY);
     if (fd < 0)
-        fatal("pi-blaster: Failed to open %s: %m\n", pagemap_fn);
+        fatal("rpio-pwm: Failed to open %s: %m\n", pagemap_fn);
     if (lseek(fd, (uint32_t)virtbase >> 9, SEEK_SET) !=
                         (uint32_t)virtbase >> 9) {
-        fatal("pi-blaster: Failed to seek on %s: %m\n", pagemap_fn);
+        fatal("rpio-pwm: Failed to seek on %s: %m\n", pagemap_fn);
     }
     for (i = 0; i < NUM_PAGES; i++) {
         uint64_t pfn;
@@ -331,9 +334,9 @@ make_pagemap(void)
         // Following line forces page to be allocated
         page_map[i].virtaddr[0] = 0;
         if (read(fd, &pfn, sizeof(pfn)) != sizeof(pfn))
-            fatal("pi-blaster: Failed to read %s: %m\n", pagemap_fn);
+            fatal("rpio-pwm: Failed to read %s: %m\n", pagemap_fn);
         if (((pfn >> 55) & 0x1bf) != 0x10c)
-            fatal("pi-blaster: Page %d not present (pfn 0x%016llx)\n", i, pfn);
+            fatal("rpio-pwm: Page %d not present (pfn 0x%016llx)\n", i, pfn);
         page_map[i].physaddr = (uint32_t)pfn << PAGE_SHIFT | 0x40000000;
     }
     close(fd);
@@ -482,7 +485,7 @@ go_go_go(void)
     FILE *fp;
 
     if ((fp = fopen(DEVFILE, "r+")) == NULL)
-        fatal("pi-blaster: Failed to open %s: %m\n", DEVFILE);
+        fatal("rpio-pwm: Failed to open %s: %m\n", DEVFILE);
 
     char *lineptr = NULL, nl;
     size_t linelen;
@@ -507,14 +510,17 @@ go_go_go(void)
     }
 }
 
-int
-main(int argc, char **argv)
+int 
+helloworld() 
 {
-    int i;
+    printf("Hello World");
+}
 
-    // Very crude...
-    if (argc == 2 && !strcmp(argv[1], "--pcm"))
-        delay_hw = DELAY_VIA_PCM;
+int 
+startpwm()
+{
+    // Setup Part
+    int i;
 
     printf("Using hardware:                 %5s\n", delay_hw == DELAY_VIA_PWM ? "PWM" : "PCM");
     printf("Number of channels:             %5d\n", NUM_CHANNELS);
@@ -525,6 +531,7 @@ main(int argc, char **argv)
 
     setup_sighandlers();
 
+    // Get memory addresses
     dma_reg = map_peripheral(DMA_BASE, DMA_LEN);
     pwm_reg = map_peripheral(PWM_BASE, PWM_LEN);
     pcm_reg = map_peripheral(PCM_BASE, PCM_LEN);
@@ -535,12 +542,13 @@ main(int argc, char **argv)
             MAP_SHARED|MAP_ANONYMOUS|MAP_NORESERVE|MAP_LOCKED,
             -1, 0);
     if (virtbase == MAP_FAILED)
-        fatal("pi-blaster: Failed to mmap physical pages: %m\n");
+        fatal("rpio-pwm: Failed to mmap physical pages: %m\n");
     if ((unsigned long)virtbase & (PAGE_SIZE-1))
-        fatal("pi-blaster: Virtual address is not page aligned\n");
+        fatal("rpio-pwm: Virtual address is not page aligned\n");
 
     make_pagemap();
 
+    // Set 8 gpios to output
     for (i = 0; i < NUM_CHANNELS; i++) {
         gpio_set(pin2gpio[i], 0);
         gpio_set_mode(pin2gpio[i], GPIO_MODE_OUT);
@@ -552,12 +560,12 @@ main(int argc, char **argv)
 
     unlink(DEVFILE);
     if (mkfifo(DEVFILE, 0666) < 0)
-        fatal("pi-blaster: Failed to create %s: %m\n", DEVFILE);
+        fatal("rpio-pwm: Failed to create %s: %m\n", DEVFILE);
     if (chmod(DEVFILE, 0666) < 0)
-        fatal("pi-blaster: Failed to set permissions on %s: %m\n", DEVFILE);
+        fatal("rpio-pwm: Failed to set permissions on %s: %m\n", DEVFILE);
 
     if (daemon(0,1) < 0)
-        fatal("pi-blaster: Failed to daemonize process: %m\n");
+        fatal("rpio-pwm: Failed to daemonize process: %m\n");
 
     go_go_go();
 
