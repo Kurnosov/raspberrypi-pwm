@@ -1,9 +1,11 @@
 /*
- * servod.c Multiple Servo Driver for the RaspberryPi
- * Copyright (c) 2013 Richard Hirst <richardghirst@gmail.com>
+ * rpio_pwm.c DMA PWM  Driver for the RaspberryPi
+ * Copyright (c) 2013 Chris Hager <chris@linuxuser.at>
  *
- * This program provides very similar functionality to servoblaster, except
- * that rather than implementing it as a kernel module, servod implements
+ * Based on the excellent servod.c by Richard Hirst <richardghirst@gmail.com>
+ *
+ * This program provides very similar functionality to rpio-pwm, except
+ * that rather than implementing it as a kernel module, rpio-pwm implements
  * the functionality as a usr space daemon.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -35,45 +37,57 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 
-static uint8_t pin2gpio[] = {
-    4,  // P1-7
-    17, // P1-11
-    18, // P1-12
-    21, // P1-13
-    22, // P1-15
-    23, // P1-16
-    24, // P1-18
-    25, // P1-22
+static uint8_t gpio_list[] = {
+    4,    // P1-7
+    17,    // P1-11
+    18,    // P1-12
+    21,    // P1-13
+    22,    // P1-15
+    23,    // P1-16
+    24,    // P1-18
+    25,    // P1-22
 };
 
-#define NUM_CHANNELS        (sizeof(pin2gpio)/sizeof(pin2gpio[0]))
+#define NUM_GPIOS       (sizeof(gpio_list)/sizeof(gpio_list[0]))
 
-#define DEVFILE         "/dev/pi-blaster"
+#define DEVFILE         "/dev/rpio-pwm"
 
 #define PAGE_SIZE       4096
 #define PAGE_SHIFT      12
 
-// PERIOD_TIME_US is the period of the PWM signal in us.
-// Typically it should be 20ms, or 20000us.
+// CYCLE_TIME_US is the pulse cycle time per servo, in microseconds.
+// Typically it should be 20ms, or 20,000us. For 8 gpios this results
+// in a cycle time of 2.5ms per gpio.
+#define CYCLE_TIME_US   20000
+#define SERVO_TIME_US   (CYCLE_TIME_US/NUM_GPIOS)  // eg. 2,500us
 
 // SAMPLE_US is the pulse width increment granularity, again in microseconds.
+// The width parameter specified for set_pwm() multiplies the SAMPLE_US value,
+// therefore to get a PWM signal with a pulse of 1.2ms with a SAMPLE_US of 10,
+// you'll need to specify `width`=120
+
 // Setting SAMPLE_US too low will likely cause problems as the DMA controller
 // will use too much memory bandwidth.  10us is a good value, though you
 // might be ok setting it as low as 2us.
-
-#define CYCLE_TIME_US       10000
 #define SAMPLE_US       10
+
+// SERVO_SAMPLES is the maximum width value + 1
+#define SERVO_SAMPLES   (SERVO_TIME_US/SAMPLE_US)  // eg. 250
+
+#define SERVO_MIN       0
+#define SERVO_MAX       (SERVO_SAMPLES - 1)
 #define NUM_SAMPLES     (CYCLE_TIME_US/SAMPLE_US)
 #define NUM_CBS         (NUM_SAMPLES*2)
 
 #define NUM_PAGES       ((NUM_CBS * 32 + NUM_SAMPLES * 4 + \
-                    PAGE_SIZE - 1) >> PAGE_SHIFT)
+                          PAGE_SIZE - 1) >> PAGE_SHIFT)
 
+// Memory Addresses
 #define DMA_BASE        0x20007000
 #define DMA_LEN         0x24
 #define PWM_BASE        0x2020C000
 #define PWM_LEN         0x28
-#define CLK_BASE            0x20101000
+#define CLK_BASE        0x20101000
 #define CLK_LEN         0xA8
 #define GPIO_BASE       0x20200000
 #define GPIO_LEN        0x100
@@ -81,27 +95,30 @@ static uint8_t pin2gpio[] = {
 #define PCM_LEN         0x24
 
 #define DMA_NO_WIDE_BURSTS  (1<<26)
-#define DMA_WAIT_RESP       (1<<3)
+#define DMA_WAIT_RESP   (1<<3)
 #define DMA_D_DREQ      (1<<6)
-#define DMA_PER_MAP(x)      ((x)<<16)
+#define DMA_PER_MAP(x)  ((x)<<16)
 #define DMA_END         (1<<1)
 #define DMA_RESET       (1<<31)
 #define DMA_INT         (1<<2)
 
 #define DMA_CS          (0x00/4)
-#define DMA_CONBLK_AD       (0x04/4)
+#define DMA_CONBLK_AD   (0x04/4)
 #define DMA_DEBUG       (0x20/4)
 
+// GPIO Memory Addresses
 #define GPIO_FSEL0      (0x00/4)
 #define GPIO_SET0       (0x1c/4)
 #define GPIO_CLR0       (0x28/4)
 #define GPIO_LEV0       (0x34/4)
 #define GPIO_PULLEN     (0x94/4)
-#define GPIO_PULLCLK        (0x98/4)
+#define GPIO_PULLCLK    (0x98/4)
 
-#define GPIO_MODE_IN        0
-#define GPIO_MODE_OUT       1
+// GPIO Modes (IN=0, OUT=1)
+#define GPIO_MODE_IN    0
+#define GPIO_MODE_OUT   1
 
+// PWM Memory Addresses
 #define PWM_CTL         (0x00/4)
 #define PWM_DMAC        (0x08/4)
 #define PWM_RNG1        (0x10/4)
@@ -110,13 +127,13 @@ static uint8_t pin2gpio[] = {
 #define PWMCLK_CNTL     40
 #define PWMCLK_DIV      41
 
-#define PWMCTL_MODE1        (1<<1)
-#define PWMCTL_PWEN1        (1<<0)
+#define PWMCTL_MODE1    (1<<1)
+#define PWMCTL_PWEN1    (1<<0)
 #define PWMCTL_CLRF     (1<<6)
-#define PWMCTL_USEF1        (1<<5)
+#define PWMCTL_USEF1    (1<<5)
 
-#define PWMDMAC_ENAB        (1<<31)
-#define PWMDMAC_THRSHLD     ((15<<8)|(15<<0))
+#define PWMDMAC_ENAB    (1<<31)
+#define PWMDMAC_THRSHLD ((15<<8) | (15<<0))
 
 #define PCM_CS_A        (0x00/4)
 #define PCM_FIFO_A      (0x04/4)
@@ -125,14 +142,14 @@ static uint8_t pin2gpio[] = {
 #define PCM_TXC_A       (0x10/4)
 #define PCM_DREQ_A      (0x14/4)
 #define PCM_INTEN_A     (0x18/4)
-#define PCM_INT_STC_A       (0x1c/4)
+#define PCM_INT_STC_A   (0x1c/4)
 #define PCM_GRAY        (0x20/4)
 
 #define PCMCLK_CNTL     38
 #define PCMCLK_DIV      39
 
-#define DELAY_VIA_PWM       0
-#define DELAY_VIA_PCM       1
+#define DELAY_VIA_PWM   0
+#define DELAY_VIA_PCM   1
 
 typedef struct {
     uint32_t info, src, dst, length,
@@ -161,11 +178,9 @@ static volatile uint32_t *gpio_reg;
 
 static int delay_hw = DELAY_VIA_PWM;
 
-static float channel_pwm[NUM_CHANNELS];
+static void set_servo(int servo, int width);
 
-static void set_pwm(int channel, float value);
-static void update_pwm();
-
+// Sets a GPIO to either GPIO_MODE_IN(=0) or GPIO_MODE_OUT(=1)
 static void
 gpio_set_mode(uint32_t pin, uint32_t mode)
 {
@@ -176,6 +191,7 @@ gpio_set_mode(uint32_t pin, uint32_t mode)
     gpio_reg[GPIO_FSEL0 + pin/10] = fsel;
 }
 
+// Sets the gpio to input (level=1) or output (level=0)
 static void
 gpio_set(int pin, int level)
 {
@@ -185,6 +201,7 @@ gpio_set(int pin, int level)
         gpio_reg[GPIO_CLR0] = 1 << pin;
 }
 
+// Very short delay
 static void
 udelay(int us)
 {
@@ -193,15 +210,15 @@ udelay(int us)
     nanosleep(&ts, NULL);
 }
 
+// Shutdown -- its super important to reset the DMA before quitting
 static void
 terminate(int dummy)
 {
     int i;
 
     if (dma_reg && virtbase) {
-        for (i = 0; i < NUM_CHANNELS; i++)
-            channel_pwm[i] = 0;
-        update_pwm();
+        for (i = 0; i < NUM_GPIOS; i++)
+            set_servo(i, 0);
         udelay(CYCLE_TIME_US);
         dma_reg[DMA_CS] = DMA_RESET;
         udelay(10);
@@ -210,6 +227,7 @@ terminate(int dummy)
     exit(1);
 }
 
+// Shutdown with an error
 static void
 fatal(char *fmt, ...)
 {
@@ -221,6 +239,21 @@ fatal(char *fmt, ...)
     terminate(0);
 }
 
+// Catch all signals possible - it is vital we kill the DMA engine
+// on process exit!
+static void
+setup_sighandlers(void)
+{
+    int i;
+    for (i = 0; i < 64; i++) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = terminate;
+        sigaction(i, &sa, NULL);
+    }
+}
+
+// Memory mapping
 static uint32_t
 mem_virt_to_phys(void *virt)
 {
@@ -229,6 +262,7 @@ mem_virt_to_phys(void *virt)
     return page_map[offset >> PAGE_SHIFT].physaddr + (offset % PAGE_SIZE);
 }
 
+// More memory mapping
 static void *
 map_peripheral(uint32_t base, uint32_t len)
 {
@@ -236,74 +270,40 @@ map_peripheral(uint32_t base, uint32_t len)
     void * vaddr;
 
     if (fd < 0)
-        fatal("pi-blaster: Failed to open /dev/mem: %m\n");
+        fatal("rpio-pwm: Failed to open /dev/mem: %m\n");
     vaddr = mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, base);
     if (vaddr == MAP_FAILED)
-        fatal("pi-blaster: Failed to map peripheral at 0x%08x: %m\n", base);
+        fatal("rpio-pwm: Failed to map peripheral at 0x%08x: %m\n", base);
     close(fd);
 
     return vaddr;
 }
 
+// Set one servo to a specific pulse
 static void
-set_pwm(int channel, float width)
+set_servo(int servo, int width)
 {
-    channel_pwm[channel] = width;
-    update_pwm();
-}
-
-
-/*
- * What we need to do here is:
- *   First DMA command turns on the pins that are >0
- *   All the other packets turn off the pins that are not used
- *
- * For the cpb packets (The DMA control packet)
- *  -> cbp[0]->dst = gpset0: set   the pwms that are active
- *  -> cbp[*]->dst = gpclr0: clear when the sample has a value
- * 
- * For the samples     (The value that is written by the DMA command to cbp[n]->dst)
- *  -> dp[0] = mask of the pwms that are active
- *  -> dp[n] = mask of the pwm to stop at time n
- *
- * We dont really need to reset the cb->dst each time but I believe it helps a lot
- * in code readability in case someone wants to generate more complex signals.
- */
-static void
-update_pwm()
-{
+    struct ctl *ctl = (struct ctl *)virtbase;
+    dma_cb_t *cbp = ctl->cb + servo * SERVO_SAMPLES * 2;
     uint32_t phys_gpclr0 = 0x7e200000 + 0x28;
     uint32_t phys_gpset0 = 0x7e200000 + 0x1c;
-    struct ctl *ctl = (struct ctl *)virtbase;
-    int i, j;
-    uint32_t mask;
-    
-    /* First we turn on the channels that need to be on */
-    /*   Take the first DMA Packet and set it's target to gpset0 register */
-    ctl->cb[0].dst = phys_gpset0;
+    uint32_t *dp = ctl->sample + servo * SERVO_SAMPLES;
+    int i;
+    uint32_t mask = 1 << gpio_list[servo];
 
-    /*   Now create a mask of all the pins that should be on */
-    mask = 0;
-    for (i = 0; i < NUM_CHANNELS; i++) {
-        if (channel_pwm[i] > 0) {
-            mask |= 1 << pin2gpio[i];
-        }
-    }
-    /*   And give that to the DMA controller to write */
-    ctl->sample[0] = mask;
-    
-    /* Now we go through all the samples and turn the pins off when needed */
-    for (j = 1; j < NUM_SAMPLES; j++) {
-        ctl->cb[j*2].dst = phys_gpclr0;
-        mask = 0;
-        for (i = 0; i < NUM_CHANNELS; i++) {
-            if ((float)j/NUM_SAMPLES > channel_pwm[i])
-                mask |= 1 << pin2gpio[i];
-        }
-        ctl->sample[j] = mask;
+    dp[width] = mask;
+
+    if (width == 0) {
+        cbp->dst = phys_gpclr0;
+    } else {
+        for (i = width - 1; i > 0; i--)
+            dp[i] = 0;
+        dp[0] = mask;
+        cbp->dst = phys_gpset0;
     }
 }
 
+// Initialize the memory pagemap
 static void
 make_pagemap(void)
 {
@@ -312,18 +312,18 @@ make_pagemap(void)
 
     page_map = malloc(NUM_PAGES * sizeof(*page_map));
     if (page_map == 0)
-        fatal("pi-blaster: Failed to malloc page_map: %m\n");
+        fatal("rpio-pwm: Failed to malloc page_map: %m\n");
     memfd = open("/dev/mem", O_RDWR);
     if (memfd < 0)
-        fatal("pi-blaster: Failed to open /dev/mem: %m\n");
+        fatal("rpio-pwm: Failed to open /dev/mem: %m\n");
     pid = getpid();
     sprintf(pagemap_fn, "/proc/%d/pagemap", pid);
     fd = open(pagemap_fn, O_RDONLY);
     if (fd < 0)
-        fatal("pi-blaster: Failed to open %s: %m\n", pagemap_fn);
+        fatal("rpio-pwm: Failed to open %s: %m\n", pagemap_fn);
     if (lseek(fd, (uint32_t)virtbase >> 9, SEEK_SET) !=
                         (uint32_t)virtbase >> 9) {
-        fatal("pi-blaster: Failed to seek on %s: %m\n", pagemap_fn);
+        fatal("rpio-pwm: Failed to seek on %s: %m\n", pagemap_fn);
     }
     for (i = 0; i < NUM_PAGES; i++) {
         uint64_t pfn;
@@ -331,30 +331,16 @@ make_pagemap(void)
         // Following line forces page to be allocated
         page_map[i].virtaddr[0] = 0;
         if (read(fd, &pfn, sizeof(pfn)) != sizeof(pfn))
-            fatal("pi-blaster: Failed to read %s: %m\n", pagemap_fn);
+            fatal("rpio-pwm: Failed to read %s: %m\n", pagemap_fn);
         if (((pfn >> 55) & 0x1bf) != 0x10c)
-            fatal("pi-blaster: Page %d not present (pfn 0x%016llx)\n", i, pfn);
+            fatal("rpio-pwm: Page %d not present (pfn 0x%016llx)\n", i, pfn);
         page_map[i].physaddr = (uint32_t)pfn << PAGE_SHIFT | 0x40000000;
     }
     close(fd);
     close(memfd);
 }
 
-static void
-setup_sighandlers(void)
-{
-    int i;
 
-    // Catch all signals possible - it is vital we kill the DMA engine
-    // on process exit!
-    for (i = 0; i < 64; i++) {
-        struct sigaction sa;
-
-        memset(&sa, 0, sizeof(sa));
-        sa.sa_handler = terminate;
-        sigaction(i, &sa, NULL);
-    }
-}
 
 static void
 init_ctrl_data(void)
@@ -363,8 +349,7 @@ init_ctrl_data(void)
     dma_cb_t *cbp = ctl->cb;
     uint32_t phys_fifo_addr;
     uint32_t phys_gpclr0 = 0x7e200000 + 0x28;
-    uint32_t mask;
-    int i;
+    int servo, i;
 
     if (delay_hw == DELAY_VIA_PWM)
         phys_fifo_addr = (PWM_BASE | 0x7e000000) + 0x18;
@@ -372,21 +357,12 @@ init_ctrl_data(void)
         phys_fifo_addr = (PCM_BASE | 0x7e000000) + 0x04;
 
     memset(ctl->sample, 0, sizeof(ctl->sample));
+    for (servo = 0 ; servo < NUM_GPIOS; servo++) {
+        for (i = 0; i < SERVO_SAMPLES; i++)
+            ctl->sample[servo * SERVO_SAMPLES + i] = 1 << gpio_list[servo];
+    }
 
-    // Calculate a mask to turn off all the servos
-    mask = 0;
-    for (i = 0; i < NUM_CHANNELS; i++)
-        mask |= 1 << pin2gpio[i];
-    for (i = 0; i < NUM_SAMPLES; i++)
-        ctl->sample[i] = mask;
-
-    /* Initialize all the DMA commands. They come in pairs.
-     *  - 1st command copies a value from the sample memory to a destination
-     *    address which can be either the gpclr0 register or the gpset0 register
-     *  - 2nd command waits for a trigger from an external source (PWM or PCM)
-     */
     for (i = 0; i < NUM_SAMPLES; i++) {
-        /* First DMA command */
         cbp->info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP;
         cbp->src = mem_virt_to_phys(ctl->sample + i);
         cbp->dst = phys_gpclr0;
@@ -394,12 +370,12 @@ init_ctrl_data(void)
         cbp->stride = 0;
         cbp->next = mem_virt_to_phys(cbp + 1);
         cbp++;
-        /* Second DMA command */
+        // Delay
         if (delay_hw == DELAY_VIA_PWM)
             cbp->info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_D_DREQ | DMA_PER_MAP(5);
         else
             cbp->info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_D_DREQ | DMA_PER_MAP(2);
-        cbp->src = mem_virt_to_phys(ctl);   // Any data will do
+        cbp->src = mem_virt_to_phys(ctl);    // Any data will do
         cbp->dst = phys_fifo_addr;
         cbp->length = 4;
         cbp->stride = 0;
@@ -410,6 +386,7 @@ init_ctrl_data(void)
     cbp->next = mem_virt_to_phys(ctl->cb);
 }
 
+// Initialize PWM (or PCM) and DMA
 static void
 init_hardware(void)
 {
@@ -419,11 +396,11 @@ init_hardware(void)
         // Initialise PWM
         pwm_reg[PWM_CTL] = 0;
         udelay(10);
-        clk_reg[PWMCLK_CNTL] = 0x5A000006;      // Source=PLLD (500MHz)
+        clk_reg[PWMCLK_CNTL] = 0x5A000006;        // Source=PLLD (500MHz)
         udelay(100);
         clk_reg[PWMCLK_DIV] = 0x5A000000 | (50<<12);    // set pwm div to 50, giving 10MHz
         udelay(100);
-        clk_reg[PWMCLK_CNTL] = 0x5A000016;      // Source=PLLD and enable
+        clk_reg[PWMCLK_CNTL] = 0x5A000016;        // Source=PLLD and enable
         udelay(100);
         pwm_reg[PWM_RNG1] = SAMPLE_US * 10;
         udelay(10);
@@ -435,23 +412,23 @@ init_hardware(void)
         udelay(10);
     } else {
         // Initialise PCM
-        pcm_reg[PCM_CS_A] = 1;              // Disable Rx+Tx, Enable PCM block
+        pcm_reg[PCM_CS_A] = 1;                // Disable Rx+Tx, Enable PCM block
         udelay(100);
-        clk_reg[PCMCLK_CNTL] = 0x5A000006;      // Source=PLLD (500MHz)
+        clk_reg[PCMCLK_CNTL] = 0x5A000006;        // Source=PLLD (500MHz)
         udelay(100);
         clk_reg[PCMCLK_DIV] = 0x5A000000 | (50<<12);    // Set pcm div to 50, giving 10MHz
         udelay(100);
-        clk_reg[PCMCLK_CNTL] = 0x5A000016;      // Source=PLLD and enable
+        clk_reg[PCMCLK_CNTL] = 0x5A000016;        // Source=PLLD and enable
         udelay(100);
         pcm_reg[PCM_TXC_A] = 0<<31 | 1<<30 | 0<<20 | 0<<16; // 1 channel, 8 bits
         udelay(100);
         pcm_reg[PCM_MODE_A] = (SAMPLE_US * 10 - 1) << 10;
         udelay(100);
-        pcm_reg[PCM_CS_A] |= 1<<4 | 1<<3;       // Clear FIFOs
+        pcm_reg[PCM_CS_A] |= 1<<4 | 1<<3;        // Clear FIFOs
         udelay(100);
-        pcm_reg[PCM_DREQ_A] = 64<<24 | 64<<8;       // DMA Req when one slot is free?
+        pcm_reg[PCM_DREQ_A] = 64<<24 | 64<<8;        // DMA Req when one slot is free?
         udelay(100);
-        pcm_reg[PCM_CS_A] |= 1<<9;          // Enable DMA
+        pcm_reg[PCM_CS_A] |= 1<<9;            // Enable DMA
         udelay(100);
     }
 
@@ -461,48 +438,41 @@ init_hardware(void)
     dma_reg[DMA_CS] = DMA_INT | DMA_END;
     dma_reg[DMA_CONBLK_AD] = mem_virt_to_phys(ctl->cb);
     dma_reg[DMA_DEBUG] = 7; // clear debug error flags
-    dma_reg[DMA_CS] = 0x10880001;   // go, mid priority, wait for outstanding writes
+    dma_reg[DMA_CS] = 0x10880001;    // go, mid priority, wait for outstanding writes
 
     if (delay_hw == DELAY_VIA_PCM) {
-        pcm_reg[PCM_CS_A] |= 1<<2;          // Enable Tx
+        pcm_reg[PCM_CS_A] |= 1<<2;            // Enable Tx
     }
 }
 
-static void
-init_channel_pwm(void)
-{
-    int i;
-    for (i = 0; i < NUM_CHANNELS; i++)
-        channel_pwm[i] = 0;
-}
-
+// Endless loop to read the FIFO DEVFILE and set the servos according
+// to the values in the FIFO
 static void
 go_go_go(void)
 {
     FILE *fp;
 
     if ((fp = fopen(DEVFILE, "r+")) == NULL)
-        fatal("pi-blaster: Failed to open %s: %m\n", DEVFILE);
+        fatal("rpio-pwm: Failed to open %s: %m\n", DEVFILE);
 
     char *lineptr = NULL, nl;
     size_t linelen;
 
     for (;;) {
-        int n, servo;
-        float value;
+        int n, width, servo;
 
         if ((n = getline(&lineptr, &linelen, fp)) < 0)
             continue;
         //fprintf(stderr, "[%d]%s", n, lineptr);
-        n = sscanf(lineptr, "%d=%f%c", &servo, &value, &nl);
+        n = sscanf(lineptr, "%d=%d%c", &servo, &width, &nl);
         if (n !=3 || nl != '\n') {
             fprintf(stderr, "Bad input: %s", lineptr);
-        } else if (servo < 0 || servo >= NUM_CHANNELS) {
-            fprintf(stderr, "Invalid channel number %d\n", servo);
-        } else if (value < 0 || value > 1) {
-            fprintf(stderr, "Invalid value %f\n", value);
+        } else if (servo < 0 || servo >= NUM_GPIOS) {
+            fprintf(stderr, "Invalid servo number %d\n", servo);
+        } else if (width < SERVO_MIN || width > SERVO_MAX) {
+            fprintf(stderr, "Invalid width %d (must be between %d and %d)\n", width, SERVO_MIN, SERVO_MAX);
         } else {
-            set_pwm(servo, value);
+            set_servo(servo, width);
         }
     }
 }
@@ -516,12 +486,12 @@ main(int argc, char **argv)
     if (argc == 2 && !strcmp(argv[1], "--pcm"))
         delay_hw = DELAY_VIA_PCM;
 
-    printf("Using hardware:                 %5s\n", delay_hw == DELAY_VIA_PWM ? "PWM" : "PCM");
-    printf("Number of channels:             %5d\n", NUM_CHANNELS);
-    printf("PWM frequency:               %5d Hz\n", 1000000/CYCLE_TIME_US);
-    printf("PWM steps:                      %5d\n", NUM_SAMPLES);
-    printf("Maximum period (100  %%):      %5dus\n", CYCLE_TIME_US);
-    printf("Minimum period (%1.3f%%):      %5dus\n", 100.0*SAMPLE_US / CYCLE_TIME_US, SAMPLE_US);
+    printf("Using hardware:      %5s\n", delay_hw == DELAY_VIA_PWM ? "PWM" : "PCM");
+    printf("Number of servos:    %5d\n", NUM_GPIOS);
+    printf("Servo cycle time:    %5dus\n", CYCLE_TIME_US);
+    printf("Pulse width units:   %5dus\n", SAMPLE_US);
+    printf("Maximum width value: %5d (%dus)\n", SERVO_MAX,
+                        SERVO_MAX * SAMPLE_US);
 
     setup_sighandlers();
 
@@ -535,29 +505,28 @@ main(int argc, char **argv)
             MAP_SHARED|MAP_ANONYMOUS|MAP_NORESERVE|MAP_LOCKED,
             -1, 0);
     if (virtbase == MAP_FAILED)
-        fatal("pi-blaster: Failed to mmap physical pages: %m\n");
+        fatal("rpio-pwm: Failed to mmap physical pages: %m\n");
     if ((unsigned long)virtbase & (PAGE_SIZE-1))
-        fatal("pi-blaster: Virtual address is not page aligned\n");
+        fatal("rpio-pwm: Virtual address is not page aligned\n");
 
     make_pagemap();
 
-    for (i = 0; i < NUM_CHANNELS; i++) {
-        gpio_set(pin2gpio[i], 0);
-        gpio_set_mode(pin2gpio[i], GPIO_MODE_OUT);
+    for (i = 0; i < NUM_GPIOS; i++) {
+        gpio_set(gpio_list[i], 0);
+        gpio_set_mode(gpio_list[i], GPIO_MODE_OUT);
     }
 
     init_ctrl_data();
     init_hardware();
-    init_channel_pwm();
 
     unlink(DEVFILE);
     if (mkfifo(DEVFILE, 0666) < 0)
-        fatal("pi-blaster: Failed to create %s: %m\n", DEVFILE);
+        fatal("rpio-pwm: Failed to create %s: %m\n", DEVFILE);
     if (chmod(DEVFILE, 0666) < 0)
-        fatal("pi-blaster: Failed to set permissions on %s: %m\n", DEVFILE);
+        fatal("rpio-pwm: Failed to set permissions on %s: %m\n", DEVFILE);
 
     if (daemon(0,1) < 0)
-        fatal("pi-blaster: Failed to daemonize process: %m\n");
+        fatal("rpio-pwm: Failed to daemonize process: %m\n");
 
     go_go_go();
 
