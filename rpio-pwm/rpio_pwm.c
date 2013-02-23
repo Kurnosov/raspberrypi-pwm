@@ -1,25 +1,29 @@
 /*
- * rpio_pwm.c DMA PWM  Driver for the RaspberryPi
- * Copyright (c) 2013 Chris Hager <chris@linuxuser.at>
+ * rpio_pwm.c: PWM via DMA for the RaspberryPi, based on the excellent
+ * ServoBlaster by Richard Hirst.
  *
- * Based on the excellent servod.c by Richard Hirst <richardghirst@gmail.com>
+ * Documentation
+ * =============
  *
- * This program provides very similar functionality to rpio-pwm, except
- * that rather than implementing it as a kernel module, rpio-pwm implements
- * the functionality as a usr space daemon.
+ * A server is controlled via the pulse-width within a fixed period (the
+ * period is defined by the servo-maker; look it up in the datasheet).
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
+ *      |<--- Period Width (20ms) ------>|
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ *      +--------+                       +--------+
+ *      |        |                       |        |
+ * -----+        +-----------------------+        +------
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ *   -->|        |<-- Pulse Width (1..2ms)
+ *
+ *
+ * This documentation is work in progress. Look here for more information:
+ * - https://github.com/metachris/raspberrypi-pwm
+ * - https://github.com/richardghirst/PiBits/blob/master/ServoBlaster
+ *
+ *
+ * Author: Chris Hager <chris@linuxuser.at>
+ * URL: https://github.com/metachris/raspberrypi-pwm
  */
 
 #include <stdio.h>
@@ -37,6 +41,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 
+// 8 GPIOs to use for driving servos
 static uint8_t gpio_list[] = {
     4,    // P1-7
     17,    // P1-11
@@ -48,39 +53,41 @@ static uint8_t gpio_list[] = {
     25,    // P1-22
 };
 
+#define DEVFILE         "/dev/rpio-pwm"
 #define NUM_GPIOS       (sizeof(gpio_list)/sizeof(gpio_list[0]))
 
-#define DEVFILE         "/dev/rpio-pwm"
+// PERIOD_TIME_US is the pulse cycle time (period) per servo, in microseconds.
+// Typically servos expect it to be 20,000us (20ms). If you are using
+// 8 channels (gpios), this results in a 2.5ms timeslot per gpio channel. A
+// servo output is set high at the start of its 2.5ms timeslot, and set low
+// after the appropriate delay.
+#define PERIOD_TIME_US       20000
 
-#define PAGE_SIZE       4096
-#define PAGE_SHIFT      12
+// PULSE_WIDTH_INCR_US is the pulse width increment granularity, again in microseconds.
+// Setting it too low will likely cause problems as the DMA controller will use too much
+//memory bandwidth. 10us is a good value, though you might be ok setting it as low as 2us.
+#define PULSE_WIDTH_INCR_US  10
 
-// CYCLE_TIME_US is the pulse cycle time per servo, in microseconds.
-// Typically it should be 20ms, or 20,000us. For 8 gpios this results
-// in a cycle time of 2.5ms per gpio.
-#define CYCLE_TIME_US   20000
-#define SERVO_TIME_US   (CYCLE_TIME_US/NUM_GPIOS)  // eg. 2,500us
+// Timeslot per channel (delay between setting pulse information)
+// With this delay it will arrive at the same channel after PERIOD_TIME.
+#define CHANNEL_TIME_US      (PERIOD_TIME_US/NUM_GPIOS)
 
-// SAMPLE_US is the pulse width increment granularity, again in microseconds.
-// The width parameter specified for set_pwm() multiplies the SAMPLE_US value,
-// therefore to get a PWM signal with a pulse of 1.2ms with a SAMPLE_US of 10,
-// you'll need to specify `width`=120
+// CHANNEL_SAMPLES is the maximum number of PULSE_WIDTH_INCR_US that fit into one gpio
+// channels timeslot. (eg. 250 for a 2500us timeslot with 10us PULSE_WIDTH_INCREMENT)
+#define CHANNEL_SAMPLES      (CHANNEL_TIME_US/PULSE_WIDTH_INCR_US)
 
-// Setting SAMPLE_US too low will likely cause problems as the DMA controller
-// will use too much memory bandwidth.  10us is a good value, though you
-// might be ok setting it as low as 2us.
-#define SAMPLE_US       10
+// Min and max channel width settings (used only for controlling user input)
+#define CHANNEL_WIDTH_MIN    0
+#define CHANNEL_WIDTH_MAX    (CHANNEL_SAMPLES - 1)
 
-// SERVO_SAMPLES is the maximum width value + 1
-#define SERVO_SAMPLES   (SERVO_TIME_US/SAMPLE_US)  // eg. 250
+// Various
+#define NUM_SAMPLES          (PERIOD_TIME_US/PULSE_WIDTH_INCR_US)
+#define NUM_CBS              (NUM_SAMPLES*2)
 
-#define SERVO_MIN       0
-#define SERVO_MAX       (SERVO_SAMPLES - 1)
-#define NUM_SAMPLES     (CYCLE_TIME_US/SAMPLE_US)
-#define NUM_CBS         (NUM_SAMPLES*2)
-
-#define NUM_PAGES       ((NUM_CBS * 32 + NUM_SAMPLES * 4 + \
-                          PAGE_SIZE - 1) >> PAGE_SHIFT)
+#define PAGE_SIZE            4096
+#define PAGE_SHIFT           12
+#define NUM_PAGES            ((NUM_CBS * 32 + NUM_SAMPLES * 4 + \
+                              PAGE_SIZE - 1) >> PAGE_SHIFT)
 
 // Memory Addresses
 #define DMA_BASE        0x20007000
@@ -219,7 +226,7 @@ terminate(int dummy)
     if (dma_reg && virtbase) {
         for (i = 0; i < NUM_GPIOS; i++)
             set_servo(i, 0);
-        udelay(CYCLE_TIME_US);
+        udelay(PERIOD_TIME_US);
         dma_reg[DMA_CS] = DMA_RESET;
         udelay(10);
     }
@@ -284,10 +291,10 @@ static void
 set_servo(int servo, int width)
 {
     struct ctl *ctl = (struct ctl *)virtbase;
-    dma_cb_t *cbp = ctl->cb + servo * SERVO_SAMPLES * 2;
+    dma_cb_t *cbp = ctl->cb + servo * CHANNEL_SAMPLES * 2;
     uint32_t phys_gpclr0 = 0x7e200000 + 0x28;
     uint32_t phys_gpset0 = 0x7e200000 + 0x1c;
-    uint32_t *dp = ctl->sample + servo * SERVO_SAMPLES;
+    uint32_t *dp = ctl->sample + servo * CHANNEL_SAMPLES;
     int i;
     uint32_t mask = 1 << gpio_list[servo];
 
@@ -358,8 +365,8 @@ init_ctrl_data(void)
 
     memset(ctl->sample, 0, sizeof(ctl->sample));
     for (servo = 0 ; servo < NUM_GPIOS; servo++) {
-        for (i = 0; i < SERVO_SAMPLES; i++)
-            ctl->sample[servo * SERVO_SAMPLES + i] = 1 << gpio_list[servo];
+        for (i = 0; i < CHANNEL_SAMPLES; i++)
+            ctl->sample[servo * CHANNEL_SAMPLES + i] = 1 << gpio_list[servo];
     }
 
     for (i = 0; i < NUM_SAMPLES; i++) {
@@ -402,7 +409,7 @@ init_hardware(void)
         udelay(100);
         clk_reg[PWMCLK_CNTL] = 0x5A000016;        // Source=PLLD and enable
         udelay(100);
-        pwm_reg[PWM_RNG1] = SAMPLE_US * 10;
+        pwm_reg[PWM_RNG1] = PULSE_WIDTH_INCR_US * 10;
         udelay(10);
         pwm_reg[PWM_DMAC] = PWMDMAC_ENAB | PWMDMAC_THRSHLD;
         udelay(10);
@@ -422,7 +429,7 @@ init_hardware(void)
         udelay(100);
         pcm_reg[PCM_TXC_A] = 0<<31 | 1<<30 | 0<<20 | 0<<16; // 1 channel, 8 bits
         udelay(100);
-        pcm_reg[PCM_MODE_A] = (SAMPLE_US * 10 - 1) << 10;
+        pcm_reg[PCM_MODE_A] = (PULSE_WIDTH_INCR_US * 10 - 1) << 10;
         udelay(100);
         pcm_reg[PCM_CS_A] |= 1<<4 | 1<<3;        // Clear FIFOs
         udelay(100);
@@ -469,8 +476,8 @@ go_go_go(void)
             fprintf(stderr, "Bad input: %s", lineptr);
         } else if (servo < 0 || servo >= NUM_GPIOS) {
             fprintf(stderr, "Invalid servo number %d\n", servo);
-        } else if (width < SERVO_MIN || width > SERVO_MAX) {
-            fprintf(stderr, "Invalid width %d (must be between %d and %d)\n", width, SERVO_MIN, SERVO_MAX);
+        } else if (width < CHANNEL_WIDTH_MIN || width > CHANNEL_WIDTH_MAX) {
+            fprintf(stderr, "Invalid width %d (must be between %d and %d)\n", width, CHANNEL_WIDTH_MIN, CHANNEL_WIDTH_MAX);
         } else {
             set_servo(servo, width);
         }
@@ -486,12 +493,12 @@ main(int argc, char **argv)
     if (argc == 2 && !strcmp(argv[1], "--pcm"))
         delay_hw = DELAY_VIA_PCM;
 
-    printf("Using hardware:      %5s\n", delay_hw == DELAY_VIA_PWM ? "PWM" : "PCM");
-    printf("Number of servos:    %5d\n", NUM_GPIOS);
-    printf("Servo cycle time:    %5dus\n", CYCLE_TIME_US);
-    printf("Pulse width units:   %5dus\n", SAMPLE_US);
-    printf("Maximum width value: %5d (%dus)\n", SERVO_MAX,
-                        SERVO_MAX * SAMPLE_US);
+    printf("Using hardware:       %s\n", delay_hw == DELAY_VIA_PWM ? "PWM" : "PCM");
+    printf("Number of servos:     %d\n", NUM_GPIOS);
+    printf("Servo cycle time:     %dus\n", PERIOD_TIME_US);
+    printf("Pulse width units:    %dus\n", PULSE_WIDTH_INCR_US);
+    printf("Maximum width value:  %d (%dus)\n", CHANNEL_WIDTH_MAX,
+                        CHANNEL_WIDTH_MAX * PULSE_WIDTH_INCR_US);
 
     setup_sighandlers();
 
